@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Quest WebXR Pose Logger</title>
+  <title>Quest WebXR Head Motion Logger</title>
   <style>
     body { font-family: system-ui; margin: 16px; }
     button { font-size: 18px; padding: 12px 16px; margin-right: 8px; }
@@ -12,21 +12,20 @@
   </style>
 </head>
 <body>
-  <h2>WebXR Pose Logger (Quest 2)</h2>
-  <p>Click start → move → stop → downloads a .txt (CSV).</p>
+  <h2>WebXR Head Motion Logger (Quest 2)</h2>
+  <p>Start → move naturally → Stop → downloads .txt (CSV).</p>
 
   <button id="startBtn">Enter VR + Start Recording</button>
   <button id="stopBtn" disabled>Stop + Download</button>
 
   <div id="status">Status: idle</div>
-
   <canvas id="c"></canvas>
 
 <script>
 let xrSession = null;
 let xrRefSpace = null;
-
 let gl = null;
+
 let records = [];
 let recording = false;
 
@@ -42,7 +41,7 @@ function vToArr(v){ return [v.x, v.y, v.z]; }
 async function start() {
   try {
     if (!navigator.xr) {
-      setStatus("navigator.xr not available. Open in Meta Quest Browser on HTTPS.");
+      setStatus("navigator.xr not available. Use Meta Quest Browser on HTTPS.");
       return;
     }
 
@@ -52,15 +51,14 @@ async function start() {
       return;
     }
 
-    // Create WebGL context and make it XR-compatible
-    gl = canvas.getContext("webgl", { alpha: false, antialias: false, preserveDrawingBuffer: false });
+    gl = canvas.getContext("webgl", { alpha:false, antialias:false });
     if (!gl) { setStatus("Failed to create WebGL context."); return; }
 
     xrSession = await navigator.xr.requestSession("immersive-vr", {
       requiredFeatures: ["local-floor"]
     });
 
-    // Important for Quest: bind an XRWebGLLayer
+    // Quest Browser often needs an XRWebGLLayer and a render loop to avoid “3 dots”.
     await gl.makeXRCompatible();
     xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
 
@@ -71,7 +69,7 @@ async function start() {
 
     startBtn.disabled = true;
     stopBtn.disabled = false;
-    setStatus("recording... (waiting for XR frames)");
+    setStatus("recording...");
 
     xrSession.addEventListener("end", () => {
       recording = false;
@@ -90,43 +88,28 @@ async function start() {
 function onXRFrame(t, frame) {
   if (!xrSession) return;
 
+  // Render a blank frame so the immersive session progresses.
   const layer = xrSession.renderState.baseLayer;
-  const pose = frame.getViewerPose(xrRefSpace);
-
-  // Minimal render (blank frame) so the session progresses
   gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  if (pose && recording) {
-    const view = pose.views[0];
-    const headPos = view.transform.position;
-    const headOri = view.transform.orientation;
+  if (recording) {
+    const pose = frame.getViewerPose(xrRefSpace);
+    if (pose) {
+      const view = pose.views[0];
+      const p = vToArr(view.transform.position);
+      const q = qToArr(view.transform.orientation);
 
-    // Controller poses (gripSpace)
-    const ctrls = { left: null, right: null };
-    for (const src of xrSession.inputSources) {
-      if (!src.gripSpace) continue;
-      const gp = frame.getPose(src.gripSpace, xrRefSpace);
-      if (!gp) continue;
-      const obj = {
-        position: vToArr(gp.transform.position),
-        orientation: qToArr(gp.transform.orientation)
-      };
-      if (src.handedness === "left") ctrls.left = obj;
-      if (src.handedness === "right") ctrls.right = obj;
+      // t is DOMHighResTimeStamp in ms from the same time origin as performance.now()
+      records.push({
+        t_ms: t,
+        t_sec: t / 1000.0,
+        px: p[0], py: p[1], pz: p[2],
+        qx: q[0], qy: q[1], qz: q[2], qw: q[3],
+      });
+
+      if (records.length % 120 === 0) setStatus(`recording... samples=${records.length}`);
     }
-
-    records.push({
-      t_ms: t,
-      head_p: vToArr(headPos),
-      head_q: qToArr(headOri),
-      left_p: ctrls.left ? ctrls.left.position : [NaN,NaN,NaN],
-      left_q: ctrls.left ? ctrls.left.orientation : [NaN,NaN,NaN,NaN],
-      right_p: ctrls.right ? ctrls.right.position : [NaN,NaN,NaN],
-      right_q: ctrls.right ? ctrls.right.orientation : [NaN,NaN,NaN,NaN],
-    });
-
-    if (records.length % 120 === 0) setStatus(`recording... samples=${records.length}`);
   }
 
   xrSession.requestAnimationFrame(onXRFrame);
@@ -137,23 +120,17 @@ function stopAndDownload() {
   stopBtn.disabled = true;
   startBtn.disabled = false;
 
-  // CSV inside a .txt
-  let out = "";
-  out += "t_ms,head_px,head_py,head_pz,head_qx,head_qy,head_qz,head_qw,";
-  out += "l_px,l_py,l_pz,l_qx,l_qy,l_qz,l_qw,";
-  out += "r_px,r_py,r_pz,r_qx,r_qy,r_qz,r_qw\n";
-
+  // CSV inside a .txt file
+  let out = "t_ms,t_sec,px,py,pz,qx,qy,qz,qw\n";
   for (const r of records) {
-    out += `${r.t_ms},${r.head_p.join(",")},${r.head_q.join(",")},`;
-    out += `${r.left_p.join(",")},${r.left_q.join(",")},`;
-    out += `${r.right_p.join(",")},${r.right_q.join(",")}\n`;
+    out += `${r.t_ms},${r.t_sec},${r.px},${r.py},${r.pz},${r.qx},${r.qy},${r.qz},${r.qw}\n`;
   }
 
   const blob = new Blob([out], { type: "text/plain" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `quest_webxr_pose_${Date.now()}.txt`;
+  a.download = `quest_webxr_headpose_${Date.now()}.txt`;
   a.click();
   URL.revokeObjectURL(url);
 

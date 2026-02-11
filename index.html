@@ -112,30 +112,36 @@ function stopAndDownload() {
   stopBtn.disabled = true;
   startBtn.disabled = false;
 
-  const payload = {
-    meta: {
-      ua: navigator.userAgent,
-      started_at_iso: new Date().toISOString(),
-      note: "WebXR provides derived pose, not raw IMU."
-    },
-    records
-  };
+  let textData = "Quest WebXR Pose Log\n";
+  textData += "Started: " + new Date().toISOString() + "\n\n";
 
-  const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+  records.forEach((r, i) => {
+    textData += `Sample ${i}\n`;
+    textData += `t_ms: ${r.t_ms}\n`;
+    textData += `Head Position: ${r.head.position.join(",")}\n`;
+    textData += `Head Orientation: ${r.head.orientation.join(",")}\n`;
+
+    r.inputs.forEach(inp => {
+      textData += `Controller (${inp.handedness}) Position: ${inp.position.join(",")}\n`;
+      textData += `Controller (${inp.handedness}) Orientation: ${inp.orientation.join(",")}\n`;
+    });
+
+    textData += "\n";
+  });
+
+  const blob = new Blob([textData], { type: "text/plain" });
   const url = URL.createObjectURL(blob);
 
   const a = document.createElement("a");
   a.href = url;
-  a.download = `quest_webxr_pose_${Date.now()}.json`;
+  a.download = `quest_webxr_pose_${Date.now()}.txt`;
   a.click();
 
   URL.revokeObjectURL(url);
-  setStatus(`stopped. downloaded ${records.length} samples (json).`);
+  setStatus(`stopped. downloaded ${records.length} samples (.txt).`);
 
-  // Optionally end XR session
   if (xrSession) xrSession.end();
 }
-
 startBtn.addEventListener("click", start);
 stopBtn.addEventListener("click", stopAndDownload);
 </script>

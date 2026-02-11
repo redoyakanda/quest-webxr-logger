@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Quest WebXR Pose Logger</title>
+  <style>
+    body { font-family: system-ui; margin: 16px; }
+    button { font-size: 18px; padding: 12px 16px; margin-right: 8px; }
+    #status { margin-top: 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>WebXR Pose Logger (Quest 2)</h2>
+  <p>1) Click “Enter VR + Start Recording”  2) Move around  3) Click “Stop + Download”</p>
+
+  <button id="startBtn">Enter VR + Start Recording</button>
+  <button id="stopBtn" disabled>Stop + Download</button>
+
+  <div id="status">Status: idle</div>
+
+<script>
+let xrSession = null;
+let xrRefSpace = null;
+let records = [];
+let recording = false;
+
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("startBtn");
+const stopBtn  = document.getElementById("stopBtn");
+
+function setStatus(s) { statusEl.textContent = "Status: " + s; }
+
+function qToArr(q){ return [q.x, q.y, q.z, q.w]; }
+function vToArr(v){ return [v.x, v.y, v.z]; }
+
+async function start() {
+  if (!navigator.xr) {
+    setStatus("navigator.xr not available (need Quest Browser WebXR).");
+    return;
+  }
+
+  const supported = await navigator.xr.isSessionSupported("immersive-vr");
+  if (!supported) {
+    setStatus("immersive-vr not supported.");
+    return;
+  }
+
+  // User gesture required to enter immersive session (click handler)
+  xrSession = await navigator.xr.requestSession("immersive-vr", {
+    requiredFeatures: ["local-floor"]
+  });
+
+  xrRefSpace = await xrSession.requestReferenceSpace("local-floor");
+
+  records = [];
+  recording = true;
+
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  setStatus("recording... (pose per XR frame)");
+
+  xrSession.addEventListener("end", () => {
+    recording = false;
+    xrSession = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    setStatus("session ended");
+  });
+
+  xrSession.requestAnimationFrame(onXRFrame);
+}
+
+function onXRFrame(t, frame) {
+  if (!xrSession) return;
+
+  // Viewer (headset) pose
+  const pose = frame.getViewerPose(xrRefSpace);
+  if (pose && recording) {
+    const view = pose.views[0];
+    const headPos = view.transform.position;
+    const headOri = view.transform.orientation;
+
+    // Controllers (inputSources) poses
+    const inputs = [];
+    for (const src of xrSession.inputSources) {
+      if (!src.gripSpace) continue;
+      const gp = frame.getPose(src.gripSpace, xrRefSpace);
+      if (!gp) continue;
+      inputs.push({
+        handedness: src.handedness, // "left" / "right" / "none"
+        position: vToArr(gp.transform.position),
+        orientation: qToArr(gp.transform.orientation)
+      });
+    }
+
+    records.push({
+      t_ms: t, // DOMHighResTimeStamp
+      head: { position: vToArr(headPos), orientation: qToArr(headOri) },
+      inputs
+    });
+
+    // Keep UI responsive
+    if (records.length % 120 === 0) setStatus(`recording... samples=${records.length}`);
+  }
+
+  xrSession.requestAnimationFrame(onXRFrame);
+}
+
+function stopAndDownload() {
+  recording = false;
+  stopBtn.disabled = true;
+  startBtn.disabled = false;
+
+  const payload = {
+    meta: {
+      ua: navigator.userAgent,
+      started_at_iso: new Date().toISOString(),
+      note: "WebXR provides derived pose, not raw IMU."
+    },
+    records
+  };
+
+  const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `quest_webxr_pose_${Date.now()}.json`;
+  a.click();
+
+  URL.revokeObjectURL(url);
+  setStatus(`stopped. downloaded ${records.length} samples (json).`);
+
+  // Optionally end XR session
+  if (xrSession) xrSession.end();
+}
+
+startBtn.addEventListener("click", start);
+stopBtn.addEventListener("click", stopAndDownload);
+</script>
+</body>
+</html>

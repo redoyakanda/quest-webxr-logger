@@ -3,144 +3,301 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Quest WebXR Head Motion Logger</title>
+  <title>WebXR + Raw IMU Logger</title>
   <style>
     body { font-family: system-ui; margin: 16px; }
-    button { font-size: 18px; padding: 12px 16px; margin-right: 8px; }
-    #status { margin-top: 12px; white-space: pre-wrap; }
-    canvas { width: 1px; height: 1px; position: fixed; left: -10000px; top: -10000px; }
+    button { font-size: 18px; padding: 10px 14px; margin: 6px 8px 6px 0; }
+    #log { white-space: pre-wrap; font-size: 14px; margin-top: 12px; }
+    .ok { color: #0a7; }
+    .bad { color: #c22; }
+    .muted { color: #666; }
   </style>
 </head>
 <body>
-  <h2>WebXR Head Motion Logger (Quest 2)</h2>
-  <p>Start → move naturally → Stop → downloads .txt (CSV).</p>
+  <h2>WebXR + Raw IMU Logger</h2>
+  <p class="muted">
+    Requires HTTPS. Will log WebXR pose + (if allowed) Gyroscope/Accelerometer/DeviceMotion.
+  </p>
 
-  <button id="startBtn">Enter VR + Start Recording</button>
-  <button id="stopBtn" disabled>Stop + Download</button>
+  <button id="btnVR">Enter VR (WebXR)</button>
+  <button id="btnStart" disabled>Start Logging</button>
+  <button id="btnStop" disabled>Stop + Download CSV</button>
 
-  <div id="status">Status: idle</div>
-  <canvas id="c"></canvas>
+  <div id="log">Status: idle</div>
 
 <script>
-let xrSession = null;
-let xrRefSpace = null;
-let gl = null;
+(() => {
+  const ui = {
+    log: document.getElementById('log'),
+    btnVR: document.getElementById('btnVR'),
+    btnStart: document.getElementById('btnStart'),
+    btnStop: document.getElementById('btnStop'),
+  };
 
-let records = [];
-let recording = false;
+  let xrSession = null;
+  let xrRefSpace = null;
+  let rafId = 0;
 
-const statusEl = document.getElementById("status");
-const startBtn = document.getElementById("startBtn");
-const stopBtn  = document.getElementById("stopBtn");
-const canvas   = document.getElementById("c");
+  // In-memory log arrays
+  const poseRows = [];
+  const imuRows = [];
 
-function setStatus(s) { statusEl.textContent = "Status: " + s; }
-function qToArr(q){ return [q.x, q.y, q.z, q.w]; }
-function vToArr(v){ return [v.x, v.y, v.z]; }
+  let isLogging = false;
 
-async function start() {
-  try {
+  function logLine(msg, cls="") {
+    const prefix = cls ? `[${cls.toUpperCase()}] ` : '';
+    ui.log.textContent = `${prefix}${msg}\n` + ui.log.textContent;
+  }
+
+  function nowMs() { return performance.now(); }
+
+  // ---------- CSV helpers ----------
+  function toCSV(headers, rows) {
+    const esc = (v) => {
+      const s = String(v ?? "");
+      return (s.includes(",") || s.includes('"') || s.includes("\n")) ? `"${s.replaceAll('"','""')}"` : s;
+    };
+    const lines = [];
+    lines.push(headers.map(esc).join(","));
+    for (const r of rows) lines.push(r.map(esc).join(","));
+    return lines.join("\n");
+  }
+
+  function downloadText(filename, text) {
+    const blob = new Blob([text], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  // ---------- WebXR pose logging ----------
+  function onXRFrame(t, frame) {
+    if (!xrSession) return;
+    rafId = xrSession.requestAnimationFrame(onXRFrame);
+
+    if (!isLogging) return;
+
+    const pose = frame.getViewerPose(xrRefSpace);
+    if (!pose) return;
+
+    // One view is enough for pose; take first view transform
+    const tr = pose.views[0].transform;
+    const p = tr.position;       // DOMPointReadOnly
+    const o = tr.orientation;    // DOMPointReadOnly (quat)
+
+    poseRows.push([
+      nowMs(),
+      t,
+      p.x, p.y, p.z,
+      o.x, o.y, o.z, o.w
+    ]);
+  }
+
+  // ---------- Raw IMU via Generic Sensor API ----------
+  const sensors = [];
+  function stopSensors() {
+    for (const s of sensors) {
+      try { s.stop(); } catch {}
+    }
+    sensors.length = 0;
+    window.ondevicemotion = null;
+    window.ondeviceorientation = null;
+  }
+
+  async function requestIOSPermissionIfNeeded() {
+    // iOS-specific; on Quest this won't run, but harmless.
+    if (typeof DeviceMotionEvent !== "undefined" &&
+        typeof DeviceMotionEvent.requestPermission === "function") {
+      const r = await DeviceMotionEvent.requestPermission();
+      if (r !== "granted") throw new Error("DeviceMotion permission not granted");
+    }
+    if (typeof DeviceOrientationEvent !== "undefined" &&
+        typeof DeviceOrientationEvent.requestPermission === "function") {
+      const r = await DeviceOrientationEvent.requestPermission();
+      if (r !== "granted") throw new Error("DeviceOrientation permission not granted");
+    }
+  }
+
+  function startGenericSensor(SensorCtor, name, fields) {
+    try {
+      const s = new SensorCtor({ frequency: 200 });
+      s.addEventListener("reading", () => {
+        if (!isLogging) return;
+        const row = [ nowMs(), name ];
+        for (const f of fields) row.push(s[f]);
+        row.push(s.timestamp ?? "");
+        imuRows.push(row);
+      });
+      s.addEventListener("error", (e) => {
+        logLine(`${name} error: ${e.error?.name || ""} ${e.error?.message || e.message || ""}`, "bad");
+      });
+      s.start();
+      sensors.push(s);
+      logLine(`${name} started (Generic Sensor API)`, "ok");
+      return true;
+    } catch (e) {
+      logLine(`${name} not available: ${e.name || ""} ${e.message || e}`, "bad");
+      return false;
+    }
+  }
+
+  async function startIMU() {
+    // Try iOS-style permission prompt if relevant (not Quest)
+    try { await requestIOSPermissionIfNeeded(); } catch (e) {
+      logLine(`Permission prompt result: ${e.message || e}`, "bad");
+    }
+
+    let any = false;
+
+    if ("Gyroscope" in window) {
+      any = startGenericSensor(Gyroscope, "Gyroscope", ["x","y","z"]) || any;
+    }
+    if ("Accelerometer" in window) {
+      any = startGenericSensor(Accelerometer, "Accelerometer", ["x","y","z"]) || any;
+    }
+    if ("LinearAccelerationSensor" in window) {
+      any = startGenericSensor(LinearAccelerationSensor, "LinearAcceleration", ["x","y","z"]) || any;
+    }
+    if ("AbsoluteOrientationSensor" in window) {
+      // quaternion fields: x,y,z,w in some implementations via .quaternion
+      try {
+        const s = new AbsoluteOrientationSensor({ frequency: 200 });
+        s.addEventListener("reading", () => {
+          if (!isLogging) return;
+          const q = s.quaternion; // Float32Array [x,y,z,w]
+          imuRows.push([ nowMs(), "AbsoluteOrientation", q?.[0], q?.[1], q?.[2], q?.[3], s.timestamp ?? "" ]);
+        });
+        s.addEventListener("error", (e) => {
+          logLine(`AbsoluteOrientation error: ${e.error?.name || ""} ${e.error?.message || e.message || ""}`, "bad");
+        });
+        s.start();
+        sensors.push(s);
+        logLine("AbsoluteOrientation started", "ok");
+        any = true;
+      } catch (e) {
+        logLine(`AbsoluteOrientation not available: ${e.name || ""} ${e.message || e}`, "bad");
+      }
+    }
+
+    // Fallback: DeviceMotionEvent / DeviceOrientationEvent
+    // Note: Many XR browsers block these, but try anyway.
+    window.addEventListener("devicemotion", (e) => {
+      if (!isLogging) return;
+      const a = e.accelerationIncludingGravity || {};
+      const r = e.rotationRate || {};
+      imuRows.push([
+        nowMs(), "DeviceMotion",
+        a.x, a.y, a.z,
+        r.alpha, r.beta, r.gamma,
+        e.interval ?? ""
+      ]);
+    }, { passive: true });
+
+    window.addEventListener("deviceorientation", (e) => {
+      if (!isLogging) return;
+      imuRows.push([
+        nowMs(), "DeviceOrientation",
+        e.alpha, e.beta, e.gamma,
+        e.absolute ? 1 : 0,
+        ""
+      ]);
+    }, { passive: true });
+
+    logLine("DeviceMotion + DeviceOrientation listeners attached", "ok");
+
+    if (!any) {
+      logLine("No Generic Sensor streams started (browser may block raw IMU).", "bad");
+    }
+  }
+
+  // ---------- WebXR session ----------
+  async function startXR() {
     if (!navigator.xr) {
-      setStatus("navigator.xr not available. Use Meta Quest Browser on HTTPS.");
+      logLine("navigator.xr not available (no WebXR).", "bad");
       return;
     }
-
-    const supported = await navigator.xr.isSessionSupported("immersive-vr");
-    if (!supported) {
-      setStatus("immersive-vr not supported on this browser/device.");
+    const ok = await navigator.xr.isSessionSupported("immersive-vr");
+    if (!ok) {
+      logLine("immersive-vr not supported.", "bad");
       return;
     }
-
-    gl = canvas.getContext("webgl", { alpha:false, antialias:false });
-    if (!gl) { setStatus("Failed to create WebGL context."); return; }
 
     xrSession = await navigator.xr.requestSession("immersive-vr", {
-      requiredFeatures: ["local-floor"]
+      optionalFeatures: ["local-floor", "bounded-floor", "hand-tracking"]
     });
-
-    // Quest Browser often needs an XRWebGLLayer and a render loop to avoid “3 dots”.
-    await gl.makeXRCompatible();
-    xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
-
-    xrRefSpace = await xrSession.requestReferenceSpace("local-floor");
-
-    records = [];
-    recording = true;
-
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-    setStatus("recording...");
 
     xrSession.addEventListener("end", () => {
-      recording = false;
+      logLine("XR session ended.", "muted");
       xrSession = null;
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
-      setStatus("session ended");
+      xrRefSpace = null;
+      ui.btnStart.disabled = true;
+      ui.btnStop.disabled = true;
+      ui.btnVR.disabled = false;
     });
 
+    xrRefSpace = await xrSession.requestReferenceSpace("local-floor");
     xrSession.requestAnimationFrame(onXRFrame);
-  } catch (e) {
-    setStatus("Start failed: " + (e && e.message ? e.message : e));
+
+    logLine("XR session started.", "ok");
+    ui.btnStart.disabled = false;
+    ui.btnVR.disabled = true;
   }
-}
 
-function onXRFrame(t, frame) {
-  if (!xrSession) return;
+  function startLogging() {
+    poseRows.length = 0;
+    imuRows.length = 0;
+    isLogging = true;
+    ui.btnStart.disabled = true;
+    ui.btnStop.disabled = false;
+    logLine("Logging ON.", "ok");
+  }
 
-  // Render a blank frame so the immersive session progresses.
-  const layer = xrSession.renderState.baseLayer;
-  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  function stopAndDownload() {
+    isLogging = false;
+    ui.btnStart.disabled = false;
+    ui.btnStop.disabled = true;
+    logLine("Logging OFF. Preparing CSVs...", "muted");
 
-  if (recording) {
-    const pose = frame.getViewerPose(xrRefSpace);
-    if (pose) {
-      const view = pose.views[0];
-      const p = vToArr(view.transform.position);
-      const q = qToArr(view.transform.orientation);
+    // Pose CSV
+    const poseCSV = toCSV(
+      ["t_perf_ms","xr_raf_t","px","py","pz","qx","qy","qz","qw"],
+      poseRows
+    );
+    downloadText("webxr_pose.csv", poseCSV);
 
-      // t is DOMHighResTimeStamp in ms from the same time origin as performance.now()
-      records.push({
-        t_ms: t,
-        t_sec: t / 1000.0,
-        px: p[0], py: p[1], pz: p[2],
-        qx: q[0], qy: q[1], qz: q[2], qw: q[3],
-      });
+    // IMU CSV: varies by source; we keep a superset
+    // For Generic sensors: [t, name, x, y, z, timestamp]
+    // For DeviceMotion:    [t, name, ax, ay, az, alpha, beta, gamma, interval]
+    const imuCSV = toCSV(
+      ["t_perf_ms","source","v1","v2","v3","v4","v5","v6","v7"],
+      imuRows
+    );
+    downloadText("raw_imu.csv", imuCSV);
 
-      if (records.length % 120 === 0) setStatus(`recording... samples=${records.length}`);
+    logLine(`Downloaded webxr_pose.csv (${poseRows.length} rows) and raw_imu.csv (${imuRows.length} rows)`, "ok");
+  }
+
+  // UI hooks
+  ui.btnVR.onclick = async () => {
+    try {
+      await startXR();
+      // Start IMU streams once the user interacted (helps permission gating)
+      await startIMU();
+    } catch (e) {
+      logLine(`Failed to start XR/IMU: ${e.message || e}`, "bad");
     }
-  }
+  };
 
-  xrSession.requestAnimationFrame(onXRFrame);
-}
+  ui.btnStart.onclick = () => startLogging();
+  ui.btnStop.onclick = () => stopAndDownload();
 
-function stopAndDownload() {
-  recording = false;
-  stopBtn.disabled = true;
-  startBtn.disabled = false;
-
-  // CSV inside a .txt file
-  let out = "t_ms,t_sec,px,py,pz,qx,qy,qz,qw\n";
-  for (const r of records) {
-    out += `${r.t_ms},${r.t_sec},${r.px},${r.py},${r.pz},${r.qx},${r.qy},${r.qz},${r.qw}\n`;
-  }
-
-  const blob = new Blob([out], { type: "text/plain" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `quest_webxr_headpose_${Date.now()}.txt`;
-  a.click();
-  URL.revokeObjectURL(url);
-
-  setStatus(`stopped. downloaded ${records.length} samples (.txt).`);
-
-  if (xrSession) xrSession.end();
-}
-
-startBtn.addEventListener("click", start);
-stopBtn.addEventListener("click", stopAndDownload);
+  logLine("Ready. Click Enter VR.", "muted");
+})();
 </script>
 </body>
 </html>

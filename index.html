@@ -3,24 +3,25 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>WebXR + Raw IMU Logger (Quest)</title>
+  <title>WebXR + Raw IMU Logger (with Permission UI)</title>
   <style>
     body { font-family: system-ui; margin: 16px; }
     button { font-size: 18px; padding: 10px 14px; margin: 6px 8px 6px 0; }
     #status { white-space: pre-wrap; font-size: 14px; margin-top: 12px; }
     canvas { width: 1px; height: 1px; position: fixed; left: -10000px; top: -10000px; }
-    .ok { color: #0a7; }
-    .bad { color: #c22; }
     .muted { color: #666; }
   </style>
 </head>
 <body>
   <h2>WebXR + Raw IMU Logger (Quest-Compatible)</h2>
-  <p class="muted">HTTPS required. Click Enter VR, then Start Logging, then Stop + Download.</p>
+  <p class="muted">
+    Must be served via HTTPS. Flow: (1) Request Sensor Permission (2) Enter VR (3) Start Logging (4) Stop + Download.
+  </p>
 
-  <button id="enterVr">Enter VR</button>
-  <button id="startLog" disabled>Start Logging</button>
-  <button id="stopLog" disabled>Stop + Download</button>
+  <button id="btnPerm">Request Sensor Permission</button>
+  <button id="btnVR">Enter VR</button>
+  <button id="btnStart" disabled>Start Logging</button>
+  <button id="btnStop" disabled>Stop + Download</button>
 
   <div id="status">Status: idle</div>
   <canvas id="c"></canvas>
@@ -28,9 +29,10 @@
 <script>
 (() => {
   const statusEl = document.getElementById("status");
-  const btnEnter = document.getElementById("enterVr");
-  const btnStart = document.getElementById("startLog");
-  const btnStop  = document.getElementById("stopLog");
+  const btnPerm  = document.getElementById("btnPerm");
+  const btnVR    = document.getElementById("btnVR");
+  const btnStart = document.getElementById("btnStart");
+  const btnStop  = document.getElementById("btnStop");
   const canvas   = document.getElementById("c");
 
   let gl = null;
@@ -42,19 +44,21 @@
   const imuRows  = [];
   const sensors  = [];
 
-  function line(msg) {
+  function log(msg) {
     statusEl.textContent = msg + "\n" + statusEl.textContent;
   }
-  function nowMs(){ return performance.now(); }
+  function nowMs() { return performance.now(); }
 
-  function toCSV(headers, rows) {
-    const esc = (v) => {
-      const s = String(v ?? "");
-      return (s.includes(",") || s.includes('"') || s.includes("\n")) ? `"${s.replaceAll('"','""')}"` : s;
-    };
-    return [headers.map(esc).join(","), ...rows.map(r => r.map(esc).join(","))].join("\n");
+  function escCSV(v) {
+    const s = String(v ?? "");
+    return (s.includes(",") || s.includes('"') || s.includes("\n")) ? `"${s.replaceAll('"','""')}"` : s;
   }
-
+  function toCSV(headers, rows) {
+    const out = [];
+    out.push(headers.map(escCSV).join(","));
+    for (const r of rows) out.push(r.map(escCSV).join(","));
+    return out.join("\n");
+  }
   function download(filename, text) {
     const blob = new Blob([text], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
@@ -67,7 +71,64 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  // ---------- Raw sensor attempts ----------
+  function prettyErr(e) {
+    const n = e?.error?.name || e?.name || "UnknownError";
+    const m = e?.error?.message || e?.message || "";
+    return `${n}${m ? ": " + m : ""}`;
+  }
+
+  // ------------------------
+  // Permission / Consent UI
+  // ------------------------
+  async function requestSensorPermissionUI() {
+    log("Requesting sensor permissions (where supported) ...");
+
+    // iOS-style prompt (won't exist on Quest, but safe to call)
+    try {
+      if (typeof DeviceMotionEvent !== "undefined" &&
+          typeof DeviceMotionEvent.requestPermission === "function") {
+        const r = await DeviceMotionEvent.requestPermission();
+        log(`DeviceMotion permission: ${r}`);
+      } else {
+        log("DeviceMotion.requestPermission not present (normal on Android/Quest).");
+      }
+    } catch (e) {
+      log("DeviceMotion permission error -> " + prettyErr(e));
+    }
+
+    try {
+      if (typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function") {
+        const r = await DeviceOrientationEvent.requestPermission();
+        log(`DeviceOrientation permission: ${r}`);
+      } else {
+        log("DeviceOrientation.requestPermission not present (normal on Android/Quest).");
+      }
+    } catch (e) {
+      log("DeviceOrientation permission error -> " + prettyErr(e));
+    }
+
+    // Permissions API (not always supported for these names)
+    if (navigator.permissions && navigator.permissions.query) {
+      for (const name of ["accelerometer", "gyroscope", "magnetometer"]) {
+        try {
+          const st = await navigator.permissions.query({ name });
+          log(`Permissions API '${name}': ${st.state}`);
+        } catch (e) {
+          log(`Permissions API query failed for '${name}' -> ${prettyErr(e)}`);
+        }
+      }
+    } else {
+      log("navigator.permissions.query not available.");
+    }
+
+    log("Done. Now click Enter VR.");
+    log("If sensors still fail: in Quest Browser, enable site permission 'Motion and sensors' (if available), then reload.");
+  }
+
+  // ------------------------
+  // Raw IMU via Generic Sensor API (if allowed)
+  // ------------------------
   function startGenericSensor(SensorCtor, name, fields) {
     try {
       const s = new SensorCtor({ frequency: 200 });
@@ -76,40 +137,71 @@
         const row = [nowMs(), name];
         for (const f of fields) row.push(s[f]);
         row.push(s.timestamp ?? "");
+        // pad to 9 columns (for consistent CSV)
+        while (row.length < 9) row.push("");
         imuRows.push(row);
       });
-      s.addEventListener("error", e => line(`${name} error: ${e.error?.name || ""} ${e.error?.message || e.message || ""}`));
+      s.addEventListener("error", (e) => log(`${name} error -> ${prettyErr(e)}`));
       s.start();
       sensors.push(s);
-      line(`${name} started`);
+      log(`${name} started`);
       return true;
     } catch (e) {
-      line(`${name} not available: ${e.name || ""} ${e.message || e}`);
+      log(`${name} failed to start -> ${prettyErr(e)}`);
       return false;
     }
   }
 
   async function startIMU() {
     let any = false;
-    if ("Gyroscope" in window) any = startGenericSensor(Gyroscope, "Gyroscope", ["x","y","z"]) || any;
-    if ("Accelerometer" in window) any = startGenericSensor(Accelerometer, "Accelerometer", ["x","y","z"]) || any;
-    if ("LinearAccelerationSensor" in window) any = startGenericSensor(LinearAccelerationSensor, "LinearAcceleration", ["x","y","z"]) || any;
 
-    // Fallbacks (often blocked in XR browsers)
+    if ("Accelerometer" in window) {
+      any = startGenericSensor(Accelerometer, "Accelerometer", ["x","y","z"]) || any;
+    } else {
+      log("Accelerometer API not present.");
+    }
+
+    if ("Gyroscope" in window) {
+      any = startGenericSensor(Gyroscope, "Gyroscope", ["x","y","z"]) || any;
+    } else {
+      log("Gyroscope API not present.");
+    }
+
+    if ("LinearAccelerationSensor" in window) {
+      any = startGenericSensor(LinearAccelerationSensor, "LinearAcceleration", ["x","y","z"]) || any;
+    } else {
+      log("LinearAccelerationSensor API not present.");
+    }
+
+    // Fallback events (often blocked in XR browsers)
     window.addEventListener("devicemotion", (e) => {
       if (!isLogging) return;
       const a = e.accelerationIncludingGravity || {};
       const r = e.rotationRate || {};
-      imuRows.push([nowMs(),"DeviceMotion", a.x,a.y,a.z, r.alpha,r.beta,r.gamma, e.interval ?? ""]);
+      const row = [nowMs(), "DeviceMotion",
+        a.x, a.y, a.z,
+        r.alpha, r.beta, r.gamma,
+        e.interval ?? ""
+      ];
+      imuRows.push(row);
     }, { passive: true });
 
     window.addEventListener("deviceorientation", (e) => {
       if (!isLogging) return;
-      imuRows.push([nowMs(),"DeviceOrientation", e.alpha,e.beta,e.gamma, e.absolute?1:0, "","",""]);
+      const row = [nowMs(), "DeviceOrientation",
+        e.alpha, e.beta, e.gamma,
+        e.absolute ? 1 : 0,
+        "", "", ""
+      ];
+      imuRows.push(row);
     }, { passive: true });
 
-    line("DeviceMotion/DeviceOrientation listeners attached");
-    if (!any) line("No Generic Sensor streams started (browser may block raw IMU).");
+    log("DeviceMotion/DeviceOrientation listeners attached.");
+
+    if (!any) {
+      log("No Generic Sensor streams started. Browser may block raw IMU for privacy.");
+      log("Try: Quest Browser → Site Info/Permissions → allow 'Motion and sensors' (if shown) → reload.");
+    }
   }
 
   function stopIMU() {
@@ -117,7 +209,9 @@
     sensors.length = 0;
   }
 
-  // ---------- WebXR render loop ----------
+  // ------------------------
+  // WebXR pose logging + minimal render
+  // ------------------------
   function onXRFrame(t, frame) {
     const session = frame.session;
     session.requestAnimationFrame(onXRFrame);
@@ -125,11 +219,11 @@
     const pose = frame.getViewerPose(xrRefSpace);
     if (!pose) return;
 
-    // Must bind the framebuffer for proper presentation
+    // Bind XR framebuffer
     const baseLayer = session.renderState.baseLayer;
     gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
 
-    // Minimal "clear" per view (enough to satisfy runtime)
+    // Minimal clear (keeps runtime happy)
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
@@ -137,45 +231,43 @@
       const tr = pose.views[0].transform;
       const p = tr.position;
       const o = tr.orientation;
-      poseRows.push([nowMs(), t, p.x,p.y,p.z, o.x,o.y,o.z,o.w]);
+      poseRows.push([nowMs(), t, p.x, p.y, p.z, o.x, o.y, o.z, o.w]);
     }
   }
 
   async function enterVR() {
-    if (!navigator.xr) throw new Error("navigator.xr not available");
+    if (!navigator.xr) throw new Error("navigator.xr not available (no WebXR).");
 
     const supported = await navigator.xr.isSessionSupported("immersive-vr");
-    if (!supported) throw new Error("immersive-vr not supported");
+    if (!supported) throw new Error("immersive-vr not supported.");
 
     // Create WebGL context
     gl = canvas.getContext("webgl", { xrCompatible: true });
-    if (!gl) throw new Error("Failed to create WebGL context");
+    if (!gl) throw new Error("Failed to create WebGL context.");
 
     xrSession = await navigator.xr.requestSession("immersive-vr", {
       optionalFeatures: ["local-floor", "bounded-floor"]
     });
 
     xrSession.addEventListener("end", () => {
-      line("XR session ended");
+      log("XR session ended.");
       xrSession = null;
       xrRefSpace = null;
-      btnEnter.disabled = false;
+      btnVR.disabled = false;
       btnStart.disabled = true;
       btnStop.disabled = true;
+      isLogging = false;
       stopIMU();
     });
 
-    // Ensure GL is XR compatible and attach XRWebGLLayer
     await gl.makeXRCompatible();
     xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
 
     xrRefSpace = await xrSession.requestReferenceSpace("local-floor");
-
-    // Start loop
     xrSession.requestAnimationFrame(onXRFrame);
 
-    line("Entered VR successfully");
-    btnEnter.disabled = true;
+    log("Entered VR successfully.");
+    btnVR.disabled = true;
     btnStart.disabled = false;
 
     // Start IMU attempts after user gesture + XR start
@@ -188,14 +280,14 @@
     isLogging = true;
     btnStart.disabled = true;
     btnStop.disabled = false;
-    line("Logging ON");
+    log("Logging ON.");
   }
 
   function stopAndDownload() {
     isLogging = false;
     btnStart.disabled = false;
     btnStop.disabled = true;
-    line("Logging OFF. Downloading...");
+    log("Logging OFF. Downloading CSV...");
 
     download("webxr_pose.csv", toCSV(
       ["t_perf_ms","xr_raf_t","px","py","pz","qx","qy","qz","qw"],
@@ -207,17 +299,21 @@
       imuRows
     ));
 
-    line(`Saved pose rows=${poseRows.length}, imu rows=${imuRows.length}`);
+    log(`Saved pose rows=${poseRows.length}, imu rows=${imuRows.length}`);
   }
 
-  btnEnter.onclick = async () => {
+  // ------------------------
+  // Wire buttons
+  // ------------------------
+  btnPerm.onclick = requestSensorPermissionUI;
+  btnVR.onclick = async () => {
     try { await enterVR(); }
-    catch (e) { line("Enter VR failed: " + (e.message || e)); }
+    catch (e) { log("Enter VR failed -> " + prettyErr(e)); }
   };
   btnStart.onclick = startLogging;
   btnStop.onclick = stopAndDownload;
 
-  line("Ready. Serve via HTTPS and click Enter VR.");
+  log("Ready. Serve via HTTPS. Click 'Request Sensor Permission', then 'Enter VR'.");
 })();
 </script>
 </body>
